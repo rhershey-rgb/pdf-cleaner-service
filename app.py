@@ -9,7 +9,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 import requests
 
-app = FastAPI(title="CNR PDF → CSV (Combined)", version="1.0.0")
+app = FastAPI(title="CNR PDF → CSV (Combined)", version="1.3.0")
 
 # =========================
 # Regex & helpers
@@ -17,11 +17,11 @@ app = FastAPI(title="CNR PDF → CSV (Combined)", version="1.0.0")
 DRIVER_HDR_RE = re.compile(r"(Delivered|Collected)\s+By:\s*(.+?)\s*\((\d+)\)", re.I)
 LOCATION_RE   = re.compile(r"Location:\s*(.+)", re.I)
 DATE_RE       = re.compile(r"\d{2}/\d{2}/\d{4}")
-ACCOUNT_RE    = re.compile(r"^C\d{3,}$", re.I)
+ACCOUNT_RE    = re.compile(r"^[A-Z]\d{5,}$", re.I)        # e.g., L798133, I782374, C123460
 SITE_CODE_RE  = re.compile(r"^[A-Z0-9]{2,4}$")
 POSTCODE_RE   = re.compile(r"[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}", re.I)
-# tolerant consignment: long digit strings, optional leading letter and hyphens
-CONS_RE       = re.compile(r"^[A-Za-z]?\d[\d-]{5,}$")
+CONS_RE       = re.compile(r"^[A-Za-z]?\d[\d-]{5,}$")     # tolerant consignment
+STOP_RATE_RE  = re.compile(r"\bStop\s+Rate\b", re.I)
 
 FINAL_COLUMNS = [
     "Type","Status","Consignment Number","Postcode","Service","Date","Size",
@@ -104,6 +104,17 @@ def parse_pdf_to_rows(pdf_bytes: bytes) -> pd.DataFrame:
         last_name = ""
         last_id = ""
 
+        # buffer for Stop Rate rows awaiting a date from "the row below"
+        pending_stop_rows: List[dict] = []
+
+        def flush_pending_with_date(found_date: str):
+            """Attach found_date to all pending Stop Rate rows and append them."""
+            nonlocal pending_stop_rows, rows
+            for sr in pending_stop_rows:
+                sr["Date"] = found_date
+                rows.append(sr)
+            pending_stop_rows = []
+
         for page in pdf.pages:
             sec, name, did = page_context(page)
             if sec == "Unknown": sec = last_sec
@@ -113,28 +124,62 @@ def parse_pdf_to_rows(pdf_bytes: bytes) -> pd.DataFrame:
 
             tables = page.extract_tables() or []
             for t in tables:
-                if not t or len(t) < 2: 
+                if not t or len(t) < 2:
                     continue
+
                 for raw in t:
                     row = [clean_ws(x) for x in raw]
-                    if not row or all(c == "" for c in row): 
+                    if not row or all(c == "" for c in row):
                         continue
 
                     joined = " ".join(row)
                     first  = row[0] if row else ""
-                    # skip headers
+                    # skip obvious header rows
                     if ("Status" in first or "Consign" in joined or
                         ("Account" in first and "Collected" in joined)):
                         continue
 
+                    # ---------- STOP RATE (no date): capture & defer date ----------
+                    if sec in ("Collection","Unknown") and any(STOP_RATE_RE.search(c or "") for c in row):
+                        account_val = row[0] if len(row) > 0 else ""
+                        collected_from_val = row[1] if len(row) > 1 else ""
+                        postcode_val = find_postcode(row)
+                        # Pay = last money-like value on the row
+                        pay_val = ""
+                        for c in reversed(row):
+                            p, _ = parse_pay_from_text(c)
+                            if p:
+                                pay_val = p
+                                break
+
+                        # Defer writing until we see the next row with a date
+                        pending_stop_rows.append({
+                            "Type": "Collection",
+                            "Status": "",
+                            "Consignment Number": "Stop Rate",
+                            "Postcode": "",
+                            "Service": "",
+                            "Date": "",                   # will be filled from next dated row
+                            "Size": "",
+                            "Items": "1",                 # <- ALWAYS 1 for Collections
+                            "Pay": format_amount(pay_val),
+                            "Enhancement": "",
+                            "Account": account_val if ACCOUNT_RE.match(account_val) else account_val,
+                            "Collected From": collected_from_val,
+                            "Collection Postcode": postcode_val,
+                            "Location": location,
+                            "Driver Name": name,
+                            "Driver ID": did,
+                        })
+                        continue
+
                     # ---------- DELIVERY (9 columns) ----------
-                    # Expected columns:
                     # Status | Consignment | Postcode | Service | Date | Size | Items | Paid | Enhancement
                     if any(is_date_ddmmyyyy(x) for x in row) and sec in ("Delivery","Unknown"):
                         r = (row + [""]*9)[:9]
                         Status, ConsNum, Postcode, Service, DateStr, Size, Items, Paid, Enhancement = r
                         if is_date_ddmmyyyy(DateStr):
-                            # Size text cleaned (strip any embedded money if OCR merged it)
+                            # Clean size text (strip any embedded money if OCR merged it)
                             _p_from_size, size_remain = parse_pay_from_text(Size)
                             size_text = size_remain or Size
 
@@ -145,14 +190,12 @@ def parse_pdf_to_rows(pdf_bytes: bytes) -> pd.DataFrame:
                             items_val = (Items or "").strip()
                             if not items_val.isdigit():
                                 paid_raw = (Paid or "")
-                                # remove money and look for leftover integer (e.g., "1" from "1 £2.09")
                                 leftover = re.sub(r"(?:¬£|£)?\s*\d+(?:\.\d{1,2})?", "", paid_raw).strip()
                                 m_int = re.search(r"\b(\d+)\b", leftover)
                                 if m_int:
                                     items_val = m_int.group(1)
-                            # final fallback: manifests are almost always 1 per delivery row
                             if not items_val.isdigit():
-                                items_val = "1"
+                                items_val = "1"  # safe fallback
 
                             enh_value = format_amount(Enhancement)
 
@@ -176,7 +219,7 @@ def parse_pdf_to_rows(pdf_bytes: bytes) -> pd.DataFrame:
                             })
                             continue
 
-                    # ---------- COLLECTION (variable shape) ----------
+                    # ---------- COLLECTION (with date; variable shape) ----------
                     # Find date; use that to split pre vs details
                     date_idx = None
                     for i, v in enumerate(row):
@@ -188,6 +231,10 @@ def parse_pdf_to_rows(pdf_bytes: bytes) -> pd.DataFrame:
                         pre = row[:date_idx]
                         date_val = row[date_idx]
                         size_cell = row[date_idx+1] if date_idx+1 < len(row) else ""
+
+                        # If we had pending Stop Rate rows, stamp them with this date now
+                        if pending_stop_rows:
+                            flush_pending_with_date(date_val)
 
                         # Pay: last money-like token in the row
                         pay_val = ""
@@ -202,8 +249,8 @@ def parse_pdf_to_rows(pdf_bytes: bytes) -> pd.DataFrame:
                         # Rightmost consignment before date (ignore "Stop Rate")
                         cons_val = ""
                         for c in reversed(pre):
-                            if "Stop Rate" in c:
-                                cons_val = ""
+                            if STOP_RATE_RE.search(c):
+                                cons_val = "Stop Rate"
                                 break
                             if is_consignment(c):
                                 cons_val = c
@@ -237,10 +284,10 @@ def parse_pdf_to_rows(pdf_bytes: bytes) -> pd.DataFrame:
                             "Service": "",
                             "Date": date_val,
                             "Size": size_text,
-                            "Items": "",
+                            "Items": "1",                 # <- ALWAYS 1 for Collections
                             "Pay": format_amount(pay_val),
                             "Enhancement": "",
-                            "Account": account_val if ACCOUNT_RE.match(account_val) else "",
+                            "Account": account_val if ACCOUNT_RE.match(account_val) else account_val,
                             "Collected From": collected_from_val,
                             "Collection Postcode": postcode_val,
                             "Location": location,
@@ -250,15 +297,21 @@ def parse_pdf_to_rows(pdf_bytes: bytes) -> pd.DataFrame:
                         continue
                     # non-data rows skipped
 
+        # End of all pages: if any Stop Rate rows never found a dated row,
+        # append them with blank Date.
+        for sr in pending_stop_rows:
+            rows.append(sr)
+
     df = pd.DataFrame(rows)
 
-    # Ensure all columns exist & order
+    # Ensure all columns exist & correct order
     for col in FINAL_COLUMNS:
         if col not in df.columns: df[col] = ""
     df = df[FINAL_COLUMNS]
 
-    # Keep only rows that actually have a consignment number
-    df = df[df["Consignment Number"].astype(str).str.strip() != ""].reset_index(drop=True)
+    # Keep rows with a consignment number OR explicit "Stop Rate"
+    keep = df["Consignment Number"].astype(str).str.strip() != ""
+    df = df[keep].reset_index(drop=True)
 
     return df
 
@@ -266,7 +319,7 @@ def parse_pdf_to_rows(pdf_bytes: bytes) -> pd.DataFrame:
 # API
 # =========================
 class UrlIn(BaseModel):
-    file_url: str  # must be a direct-download or public URL
+    file_url: str  # direct/public URL
 
 @app.get("/")
 def root():
@@ -309,3 +362,4 @@ async def process_file(file: UploadFile = File(...)):
         )
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
+
