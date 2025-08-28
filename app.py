@@ -1,124 +1,148 @@
-import io, re, urllib.request
-from datetime import datetime
-from typing import List, Optional, Tuple
-
-import pandas as pd
+import io
+import re
 import pdfplumber
-from fastapi import FastAPI, File, UploadFile, Form
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+import pandas as pd
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+import requests
 
-app = FastAPI(title="CNR PDF → CSV", version="1.0.0")
+app = FastAPI()
 
-# Optional CORS (safe defaults)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# -------------------- Regex & constants --------------------
-
-UK_POSTCODE_RE = re.compile(r"\b([A-Z]{1,2}\d{1,2}[A-Z]?)\s?(\d[A-Z]{2})\b", re.I)
-CONS_RE = re.compile(r"^[A-Za-z]?\d[\d-]{5,}$")          # consignment number
-ACCOUNT_RE = re.compile(r"^C\d{3,}$", re.I)              # account code like C123460
-MONEY_RE = re.compile(r"£?\s*(\d+(?:\.\d{2})?)")
-SITE_CODE_RE = re.compile(r"^[A-Z]{2,4}$")
-
+# ------------------------
+# Regex helpers
+# ------------------------
 DRIVER_HDR_RE = re.compile(r"(Delivered|Collected)\s+By:\s*(.+?)\s*\((\d+)\)", re.I)
 LOCATION_RE = re.compile(r"Location:\s*(.+)", re.I)
+DATE_RE = re.compile(r"\d{2}/\d{2}/\d{4}")
+ACCOUNT_RE = re.compile(r"^C\d+")
+SITE_CODE_RE = re.compile(r"^[A-Z0-9]{2,4}$")
+POSTCODE_RE = re.compile(r"[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}", re.I)
 
-FINAL_COLUMNS = [
-    "Type","Status","Consignment Number","Postcode","Service","Date","Size",
-    "Items","Pay","Enhancement","Account","Collected From",
-    "Collection Postcode","Location","Driver Name","Driver ID"
-]
 
-# -------------------- utils --------------------
+# ------------------------
+# Utilities
+# ------------------------
+def clean_ws(s: str) -> str:
+    return s.strip() if s else ""
 
-def clean_ws(s) -> str:
-    if s is None: return ""
-    return re.sub(r"\s+"," ",str(s)).strip()
 
 def is_date_ddmmyyyy(s: str) -> bool:
-    try:
-        datetime.strptime(s, "%d/%m/%Y")
-        return True
-    except Exception:
-        return False
+    return bool(DATE_RE.fullmatch(s.strip())) if s else False
 
-def format_amount(val: str) -> str:
-    """Return 2dp numeric string; tolerate ¬£, £ and commas. Empty if not parseable."""
+
+def is_consignment(s: str) -> bool:
+    return bool(re.fullmatch(r"\d{10,15}", s.strip())) if s else False
+
+
+def format_amount(s: str) -> str:
+    if not s:
+        return ""
+    s = s.replace("£", "").replace("¬£", "").strip()
     try:
-        f = float(str(val).replace("¬£","£").replace("£","").replace(",","").strip())
-        return f"{f:.2f}"
+        return f"{float(s):.2f}"
     except Exception:
         return ""
 
-def parse_pay_from_text(text: str) -> Tuple[str, str]:
-    """Extract first money amount; return (amount_2dp, remaining_text)."""
-    if not text: return "", text
-    t = text.replace("¬£","£")
-    m = MONEY_RE.search(t)
-    if not m: return "", text
-    amount = format_amount(m.group(1))
-    start, end = m.span()
-    remain = (t[:start] + t[end:]).strip()
-    remain = re.sub(r"\s{2,}"," ",remain)
-    return amount, remain
-
-def find_postcode(cells: List[str]) -> str:
-    for c in cells:
-        m = UK_POSTCODE_RE.search(c or "")
-        if m: return clean_ws(m.group(0).upper())
-    return ""
-
-def is_consignment(s: str) -> bool:
-    return bool(CONS_RE.match(str(s).strip())) if s else False
 
 def extract_location_from_first_page(pdf) -> str:
-    """Read 'Location: ...' from first page; fallback 'Unknown'."""
     try:
         first_txt = pdf.pages[0].extract_text() or ""
         for line in first_txt.splitlines():
             m = LOCATION_RE.search(line)
             if m:
                 loc = m.group(1).strip()
-                # Stop at double-spaces or end-of-line noise if present
-                loc = re.split(r"\s{2,}", loc)[0].strip()
+                loc = re.split(r"\s{2,}|(?::\s*$)", loc)[0].strip()
                 return loc
     except Exception:
         pass
     return "Unknown"
 
-def page_context(page) -> Tuple[str, str, str]:
-    """
-    Return (section_type, driver_name, driver_id)
-    section_type in {"Delivery","Collection","Unknown"}.
-    """
+
+def page_context(page):
+    """Return (section_type, driver_name, driver_id)"""
     txt = page.extract_text() or ""
     sec = "Unknown"
-    if "Collected By:" in txt: sec = "Collection"
-    elif "Delivered By:" in txt: sec = "Delivery"
+    if "Collected By:" in txt:
+        sec = "Collection"
+    elif "Delivered By:" in txt:
+        sec = "Delivery"
 
     driver_name, driver_id = "", ""
     m = DRIVER_HDR_RE.search(txt)
     if m:
-        driver_name = clean_ws(m.group(2))
-        driver_id = clean_ws(m.group(3))
+        driver_name = m.group(2).strip()
+        driver_id = m.group(3).strip()
     return sec, driver_name, driver_id
 
-# -------------------- core parsing --------------------
 
+def find_postcode(seq):
+    for c in seq:
+        if POSTCODE_RE.search(c):
+            return POSTCODE_RE.search(c).group(0)
+    return ""
+
+
+def parse_pay_from_text(txt: str):
+    if not txt:
+        return "", txt
+    m = re.search(r"(?:£|¬£)?\s*(\d+(?:\.\d{1,2})?)", txt)
+    if m:
+        val = format_amount(m.group(1))
+        remain = txt.replace(m.group(0), "").strip()
+        return val, remain
+    return "", txt
+
+
+def normalize_items_pay(items_val: str, pay_val: str) -> tuple[str, str]:
+    """Ensure Items is a count and Pay is a 2dp currency string."""
+    items = (items_val or "").strip()
+    pay = (pay_val or "").strip()
+
+    # If Items looks like money, move to Pay
+    if re.fullmatch(r"(?:¬£|£)?\s*\d+(?:\.\d{1,2})?\s*", items):
+        if not pay:
+            pay = items
+        items = ""
+
+    # If Pay is just an int and Items is blank, flip it
+    if re.fullmatch(r"\d+", pay) and (items == "" or not items.isdigit()):
+        items, pay = pay, ""
+
+    items = items if items.isdigit() else ""
+    pay = format_amount(pay)
+    return items, pay
+
+
+# ------------------------
+# Core parser
+# ------------------------
 def parse_pdf_to_rows(pdf_bytes: bytes) -> pd.DataFrame:
     rows = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         detected_location = extract_location_from_first_page(pdf)
 
+        # remember last seen context for continued tables
+        last_section = "Unknown"
+        last_driver_name = ""
+        last_driver_id = ""
+
         for page in pdf.pages:
             section_hint, page_driver_name, page_driver_id = page_context(page)
+
+            # Inherit context if missing on this page
+            if section_hint == "Unknown":
+                section_hint = last_section
+            if not page_driver_name:
+                page_driver_name = last_driver_name
+            if not page_driver_id:
+                page_driver_id = last_driver_id
+
+            # Update state
+            last_section = section_hint
+            last_driver_name = page_driver_name
+            last_driver_id = page_driver_id
+
             tables = page.extract_tables() or []
             for t in tables:
                 if not t or len(t) < 2:
@@ -130,27 +154,25 @@ def parse_pdf_to_rows(pdf_bytes: bytes) -> pd.DataFrame:
 
                     joined = " ".join(row)
                     first = row[0] if row else ""
-
-                    # skip obvious header lines
                     if ("Status" in first or "Consign" in joined or
                         ("Account" in first and "Collected" in joined)):
                         continue
 
-                    # ---------- DELIVERY ----------
+                    # -------- Delivery parsing --------
                     if len(row) >= 5 and any(is_date_ddmmyyyy(x) for x in row):
-                        r = (row + [""]*10)[:10]
+                        r = (row + [""] * 10)[:10]
                         Status, ConsNum, Postcode, Service, DateStr, Size, Paid, Items, EffortPay, Enhancement = r
-
-                        if is_date_ddmmyyyy(DateStr) and section_hint in ("Delivery","Unknown"):
-                            # Parse size/pay; handle cases like "Small ¬£0.09"
-                            pay_from_size, size_remain = parse_pay_from_text(Size)
+                        if is_date_ddmmyyyy(DateStr) and section_hint in ("Delivery", "Unknown"):
                             pay_from_paid = format_amount(Paid)
-                            pay_value = pay_from_size or pay_from_paid
+                            pay_from_size, size_remain = parse_pay_from_text(Size)
                             size_text = size_remain or Size
+                            pay_value = pay_from_size or pay_from_paid
+                            items_val = Items
+                            if items_val and format_amount(items_val) == pay_value:
+                                items_val = ""
 
-                            # Dedup if Items is just a money that equals Pay
-                            if Items and format_amount(Items) == pay_value:
-                                Items = ""
+                            # normalize Items vs Pay
+                            items_val, pay_value = normalize_items_pay(items_val, pay_value)
 
                             rows.append({
                                 "Type": "Delivery",
@@ -160,7 +182,7 @@ def parse_pdf_to_rows(pdf_bytes: bytes) -> pd.DataFrame:
                                 "Service": Service,
                                 "Date": DateStr,
                                 "Size": size_text,
-                                "Items": Items,
+                                "Items": items_val,
                                 "Pay": pay_value,
                                 "Enhancement": format_amount(Enhancement),
                                 "Account": "",
@@ -172,29 +194,23 @@ def parse_pdf_to_rows(pdf_bytes: bytes) -> pd.DataFrame:
                             })
                             continue
 
-                    # ---------- COLLECTION ----------
-                    # Heuristic: find a date; treat as collection if page says so
+                    # -------- Collection parsing --------
                     date_idx = None
                     for i, v in enumerate(row):
                         if is_date_ddmmyyyy(v):
                             date_idx = i
                             break
-                    if (section_hint in ("Collection","Unknown")) and date_idx is not None:
+                    if (section_hint in ("Collection", "Unknown")) and date_idx is not None:
                         pre = row[:date_idx]
                         date_val = row[date_idx]
-                        size_cell = row[date_idx+1] if date_idx+1 < len(row) else ""
-
-                        # Pay: last currency-looking cell in the row
+                        size_cell = row[date_idx + 1] if date_idx + 1 < len(row) else ""
                         pay_val = ""
                         for c in reversed(row):
                             p, _ = parse_pay_from_text(c)
                             if p:
                                 pay_val = p
                                 break
-
                         postcode_val = find_postcode(pre)
-
-                        # Rightmost consignment-like token before date; ignore "Stop Rate"
                         cons_val = ""
                         for c in reversed(pre):
                             if "Stop Rate" in c:
@@ -203,12 +219,9 @@ def parse_pdf_to_rows(pdf_bytes: bytes) -> pd.DataFrame:
                             if is_consignment(c):
                                 cons_val = c
                                 break
-
-                        # Account + provisional site code from the two leading cells
                         account_val = pre[0] if len(pre) >= 1 else ""
                         collected_from_val = pre[1] if len(pre) >= 2 else ""
 
-                        # Many rows embed site code + money + size together (e.g., "TPC Small ¬£0.09")
                         tokens = size_cell.split()
                         site_code = ""
                         if tokens:
@@ -243,74 +256,49 @@ def parse_pdf_to_rows(pdf_bytes: bytes) -> pd.DataFrame:
                             "Driver ID": page_driver_id,
                         })
                         continue
-                    # otherwise skip non-data rows silently
 
-    df = pd.DataFrame(rows)
+    return pd.DataFrame(rows)
 
-    # ensure all expected columns exist
-    for col in FINAL_COLUMNS:
-        if col not in df.columns:
-            df[col] = ""
 
-    # normalize numeric fields
-    df["Pay"] = df["Pay"].apply(format_amount)
-    df["Enhancement"] = df["Enhancement"].apply(format_amount)
+# ------------------------
+# API models
+# ------------------------
+class UrlIn(BaseModel):
+    file_url: str
 
-    # keep only rows with consignment numbers (your preference)
-    df = df[df["Consignment Number"].astype(str).str.strip() != ""].reset_index(drop=True)
 
-    # order columns
-    df = df[FINAL_COLUMNS]
-    return df
-
-def df_to_csv_stream(df: pd.DataFrame, filename="cleaned.csv") -> StreamingResponse:
+# ------------------------
+# Endpoints
+# ------------------------
+@app.post("/process/file")
+async def process_file(file: UploadFile = File(...)):
+    pdf_bytes = await file.read()
+    df = parse_pdf_to_rows(pdf_bytes)
     buf = io.StringIO()
     df.to_csv(buf, index=False)
     buf.seek(0)
     return StreamingResponse(
-        iter([buf.getvalue()]),
+        io.BytesIO(buf.getvalue().encode("utf-8")),
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": f"attachment; filename=cleaned.csv"}
     )
 
-# -------------------- API --------------------
-
-class URLPayload(BaseModel):
-    file_url: str  # direct PDF URL only; location/drivers auto-detected
-
-@app.get("/")
-def root():
-    return {
-        "ok": True,
-        "routes": ["/process/url", "/process/file", "/healthz"],
-        "hint": "POST a JSON body with { 'file_url': '<pdf url>' } to /process/url",
-    }
-
-@app.get("/healthz")
-def health():
-    return {"status": "healthy"}
 
 @app.post("/process/url")
-@app.post("/process/url/")
-def process_by_url(payload: URLPayload):
-    try:
-        with urllib.request.urlopen(payload.file_url) as r:
-            pdf_bytes = r.read()
-        df = parse_pdf_to_rows(pdf_bytes)
-        return df_to_csv_stream(df, filename="cleaned.csv")
-    except Exception as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
+async def process_url(data: UrlIn):
+    r = requests.get(data.file_url)
+    r.raise_for_status()
+    df = parse_pdf_to_rows(r.content)
+    buf = io.StringIO()
+    df.to_csv(buf, index=False)
+    buf.seek(0)
+    return StreamingResponse(
+        io.BytesIO(buf.getvalue().encode("utf-8")),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=cleaned.csv"}
+    )
 
-@app.post("/process/file")
-@app.post("/process/file/")
-async def process_by_file(
-    file: UploadFile = File(...),
-):
-    try:
-        pdf_bytes = await file.read()
-        df = parse_pdf_to_rows(pdf_bytes)
-        out_name = (file.filename or "cleaned").replace(".pdf","") + ".csv"
-        return df_to_csv_stream(df, filename=out_name)
-    except Exception as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
 
+@app.get("/healthz")
+async def healthz():
+    return {"status": "healthy"}
