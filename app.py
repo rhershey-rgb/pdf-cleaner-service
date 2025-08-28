@@ -1,26 +1,27 @@
 import io
 import re
+from typing import List, Tuple
+
 import pdfplumber
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 import requests
-from datetime import datetime
-from typing import List, Tuple
 
-app = FastAPI(title="CNR PDF → CSV (Combined)")
+app = FastAPI(title="CNR PDF → CSV (Combined)", version="1.0.0")
 
-# ------------------------
+# =========================
 # Regex & helpers
-# ------------------------
+# =========================
 DRIVER_HDR_RE = re.compile(r"(Delivered|Collected)\s+By:\s*(.+?)\s*\((\d+)\)", re.I)
 LOCATION_RE   = re.compile(r"Location:\s*(.+)", re.I)
 DATE_RE       = re.compile(r"\d{2}/\d{2}/\d{4}")
 ACCOUNT_RE    = re.compile(r"^C\d{3,}$", re.I)
 SITE_CODE_RE  = re.compile(r"^[A-Z0-9]{2,4}$")
 POSTCODE_RE   = re.compile(r"[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}", re.I)
-CONS_RE       = re.compile(r"^[A-Za-z]?\d[\d-]{5,}$")  # tolerant consignment
+# tolerant consignment: long digit strings, optional leading letter and hyphens
+CONS_RE       = re.compile(r"^[A-Za-z]?\d[\d-]{5,}$")
 
 FINAL_COLUMNS = [
     "Type","Status","Consignment Number","Postcode","Service","Date","Size",
@@ -35,6 +36,7 @@ def is_date_ddmmyyyy(s: str) -> bool:
     return bool(DATE_RE.fullmatch((s or "").strip()))
 
 def format_amount(s: str) -> str:
+    """Return 2dp numeric string; tolerate ¬£/£ and commas. Empty if not parseable."""
     if not s: return ""
     s = str(s).replace("¬£","£").replace("£","").replace(",","").strip()
     try:
@@ -43,6 +45,7 @@ def format_amount(s: str) -> str:
         return ""
 
 def parse_pay_from_text(txt: str) -> Tuple[str, str]:
+    """Extract a money amount; return (amount_2dp, remaining_text_without_amount)."""
     if not txt: return "", txt
     t = txt.replace("¬£","£")
     m = re.search(r"(?:£|¬£)?\s*(\d+(?:\.\d{1,2})?)", t)
@@ -88,25 +91,9 @@ def page_context(page) -> Tuple[str, str, str]:
         did  = clean_ws(m.group(3))
     return sec, name, did
 
-def normalize_items_pay(items_val: str, pay_val: str) -> Tuple[str, str]:
-    """Ensure Items is integer and Pay is 2dp money."""
-    items = (items_val or "").strip()
-    pay   = (pay_val or "").strip()
-    # If Items looks like money, move to Pay if Pay empty
-    if re.fullmatch(r"(?:¬£|£)?\s*\d+(?:\.\d{1,2})?\s*", items):
-        if not pay:
-            pay = items
-        items = ""
-    # If Pay is just an int and Items blank → flip back
-    if re.fullmatch(r"\d+", pay) and (not items or not items.isdigit()):
-        items, pay = pay, ""
-    items = items if items.isdigit() else ""
-    pay   = format_amount(pay)
-    return items, pay
-
-# ------------------------
+# =========================
 # Core parser (combined)
-# ------------------------
+# =========================
 def parse_pdf_to_rows(pdf_bytes: bytes) -> pd.DataFrame:
     rows = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -140,22 +127,34 @@ def parse_pdf_to_rows(pdf_bytes: bytes) -> pd.DataFrame:
                         ("Account" in first and "Collected" in joined)):
                         continue
 
-                    # ---------- DELIVERY (9 columns after Date) ----------
-                    # Expected: Status, ConsNum, Postcode, Service, Date, Size, Items, Paid, Enhancement
+                    # ---------- DELIVERY (9 columns) ----------
+                    # Expected columns:
+                    # Status | Consignment | Postcode | Service | Date | Size | Items | Paid | Enhancement
                     if any(is_date_ddmmyyyy(x) for x in row) and sec in ("Delivery","Unknown"):
                         r = (row + [""]*9)[:9]
                         Status, ConsNum, Postcode, Service, DateStr, Size, Items, Paid, Enhancement = r
                         if is_date_ddmmyyyy(DateStr):
-                            # Size text cleaned (strip embedded £ if present)
-                            _, size_remain = parse_pay_from_text(Size)
+                            # Size text cleaned (strip any embedded money if OCR merged it)
+                            _p_from_size, size_remain = parse_pay_from_text(Size)
                             size_text = size_remain or Size
 
-                            items_val = Items if Items.isdigit() else ""
+                            # Pay straight from Paid
                             pay_value = format_amount(Paid)
-                            enh_value = format_amount(Enhancement)
 
-                            # Final guard
-                            items_val, pay_value = normalize_items_pay(items_val, pay_value)
+                            # Items from Items cell or recover from "Paid" like "1 £2.09"
+                            items_val = (Items or "").strip()
+                            if not items_val.isdigit():
+                                paid_raw = (Paid or "")
+                                # remove money and look for leftover integer (e.g., "1" from "1 £2.09")
+                                leftover = re.sub(r"(?:¬£|£)?\s*\d+(?:\.\d{1,2})?", "", paid_raw).strip()
+                                m_int = re.search(r"\b(\d+)\b", leftover)
+                                if m_int:
+                                    items_val = m_int.group(1)
+                            # final fallback: manifests are almost always 1 per delivery row
+                            if not items_val.isdigit():
+                                items_val = "1"
+
+                            enh_value = format_amount(Enhancement)
 
                             rows.append({
                                 "Type": "Delivery",
@@ -178,7 +177,7 @@ def parse_pdf_to_rows(pdf_bytes: bytes) -> pd.DataFrame:
                             continue
 
                     # ---------- COLLECTION (variable shape) ----------
-                    # Find date position; use that to split "pre" vs "details"
+                    # Find date; use that to split pre vs details
                     date_idx = None
                     for i, v in enumerate(row):
                         if is_date_ddmmyyyy(v):
@@ -263,11 +262,19 @@ def parse_pdf_to_rows(pdf_bytes: bytes) -> pd.DataFrame:
 
     return df
 
-# ------------------------
+# =========================
 # API
-# ------------------------
+# =========================
 class UrlIn(BaseModel):
-    file_url: str
+    file_url: str  # must be a direct-download or public URL
+
+@app.get("/")
+def root():
+    return {"status":"ok","endpoints":["/process/url","/process/file","/healthz"]}
+
+@app.get("/healthz")
+def healthz():
+    return {"status":"healthy"}
 
 @app.post("/process/url")
 def process_url(body: UrlIn):
@@ -302,7 +309,3 @@ async def process_file(file: UploadFile = File(...)):
         )
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
-
-@app.get("/healthz")
-def healthz():
-    return {"status": "healthy"}
