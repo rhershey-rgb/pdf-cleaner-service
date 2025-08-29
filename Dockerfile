@@ -16,4 +16,4 @@ EXPOSE 8080
 
 # Keep a single worker; the in-app lock enforces one-at-a-time processing.
 # Tip: set Render Health Check Path to /healthz
-CMD ["sh","-c","uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1 --limit-concurrency 1 --timeout-keep-alive 5"]
+CMD ["sh","-c","uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1 --limit-concurrency 2 --timeout-keep-alive 5"]
