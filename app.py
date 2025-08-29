@@ -1,4 +1,4 @@
-import io, re, csv
+import io, re, csv, threading
 from typing import List, Tuple, Iterable, Dict
 
 import pdfplumber
@@ -7,7 +7,10 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 import requests
 
-app = FastAPI(title="CNR PDF → CSV (Streaming)", version="1.3.2")
+app = FastAPI(title="CNR PDF → CSV (Streaming, Locked)", version="1.6.0")
+
+# ---- Global lock: ensures only ONE parse/stream happens at a time ----
+parse_lock = threading.Lock()
 
 # ---- Regex / constants ----
 DRIVER_HDR_RE = re.compile(r"(Delivered|Collected)\s+By:\s*(.+?)\s*\((\d+)\)", re.I)
@@ -192,17 +195,19 @@ def iter_parsed_rows(pdf_bytes: bytes) -> Iterable[Dict[str,str]]:
         for sr in pending_stop_rows:
             yield sr
 
-# ---- CSV streaming ----
+# ---- CSV streaming with the GLOBAL LOCK held the whole time ----
 def stream_csv(pdf_bytes: bytes, filename="cleaned.csv") -> StreamingResponse:
     def gen():
-        buf = io.StringIO()
-        w = csv.DictWriter(buf, fieldnames=FINAL_COLUMNS, extrasaction="ignore")
-        w.writeheader(); yield buf.getvalue(); buf.seek(0); buf.truncate(0)
-        for row in iter_parsed_rows(pdf_bytes):
-            if not (row.get("Consignment Number") or "").strip():  # keep only real rows
-                continue
-            w.writerow({k: row.get(k, "") for k in FINAL_COLUMNS})
-            yield buf.getvalue(); buf.seek(0); buf.truncate(0)
+        # Acquire the lock for the entire parse+stream, ensuring strict one-at-a-time processing
+        with parse_lock:
+            buf = io.StringIO()
+            w = csv.DictWriter(buf, fieldnames=FINAL_COLUMNS, extrasaction="ignore")
+            w.writeheader(); yield buf.getvalue(); buf.seek(0); buf.truncate(0)
+            for row in iter_parsed_rows(pdf_bytes):
+                if not (row.get("Consignment Number") or "").strip():
+                    continue
+                w.writerow({k: row.get(k, "") for k in FINAL_COLUMNS})
+                yield buf.getvalue(); buf.seek(0); buf.truncate(0)
     return StreamingResponse(gen(), media_type="text/csv",
                              headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
@@ -211,14 +216,17 @@ class UrlIn(BaseModel):
     file_url: str
 
 @app.get("/")
-def root(): return {"status":"ok","endpoints":["/process/url","/process/file","/healthz"]}
+def root():
+    return {"status":"ok","endpoints":["/process/url","/process/file","/healthz"]}
 
 @app.get("/healthz")
-def healthz(): return {"status":"healthy"}
+def healthz():
+    return {"status":"healthy"}
 
 @app.post("/process/url")
 def process_url(body: UrlIn):
     try:
+        # Download outside the lock so we don't block while fetching
         r = requests.get(body.file_url, timeout=60)
         r.raise_for_status()
         return stream_csv(r.content, "cleaned.csv")
@@ -233,4 +241,3 @@ async def process_file(file: UploadFile = File(...)):
         return stream_csv(pdf_bytes, name)
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
-
