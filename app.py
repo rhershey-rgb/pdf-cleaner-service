@@ -2,22 +2,15 @@ import io, re, csv, threading, os
 from typing import List, Tuple, Iterable, Dict
 
 import pdfplumber
-from fastapi import FastAPI, UploadFile, File, Request
+from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 import requests
 
-app = FastAPI(title="CNR PDF → CSV (Streaming, Locked, Token)", version="1.7.0")
+app = FastAPI(title="CNR PDF → CSV (Streaming, Locked)", version="1.8.0")
 
-# ====== Security & limits ======
-JOB_TOKEN = os.getenv("JOB_TOKEN", "")     # set in Render env; if blank, auth is disabled
+# ====== Limits ======
 MAX_BYTES = int(os.getenv("MAX_BYTES", "2000000"))  # 2 MB default limit
-
-def require_token(headers) -> bool:
-    """Allow if JOB_TOKEN not set; otherwise require X-Job-Token header match."""
-    if not JOB_TOKEN:
-        return True
-    return headers.get("x-job-token") == JOB_TOKEN
 
 # ====== Global lock: exactly one parse at a time ======
 parse_lock = threading.Lock()
@@ -233,27 +226,20 @@ def healthz():
     return {"status":"healthy"}
 
 @app.post("/process/url")
-def process_url(body: UrlIn, request: Request):
-    # Auth
-    if not require_token(request.headers):
-        return JSONResponse(status_code=401, content={"error": "unauthorized"})
-    # Download (check size via headers first)
+def process_url(body: UrlIn):
     try:
         with requests.get(body.file_url, stream=True, timeout=60) as r:
             r.raise_for_status()
             cl = r.headers.get("content-length")
             if cl and int(cl) > MAX_BYTES:
                 return JSONResponse(status_code=413, content={"error": "file too large"})
-            pdf_bytes = r.content  # safe: your files are ~60–180 KB
+            pdf_bytes = r.content  # files are small (60–180 KB), safe to buffer
         return stream_csv(pdf_bytes, "cleaned.csv")
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
 
 @app.post("/process/file")
-async def process_file(file: UploadFile = File(...), request: Request = None):
-    # Auth
-    if request and not require_token(request.headers):
-        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+async def process_file(file: UploadFile = File(...)):
     try:
         pdf_bytes = await file.read()
         if len(pdf_bytes) > MAX_BYTES:
@@ -262,3 +248,4 @@ async def process_file(file: UploadFile = File(...), request: Request = None):
         return stream_csv(pdf_bytes, name)
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
+
