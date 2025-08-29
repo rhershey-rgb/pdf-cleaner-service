@@ -14,5 +14,5 @@ COPY . .
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 EXPOSE 8080
 
-# Allow health check + one job; in-app lock still enforces single processing.
+# Allow health check + one job; global lock still enforces single processing.
 CMD ["sh","-c","uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1 --limit-concurrency 2 --timeout-keep-alive 5"]
