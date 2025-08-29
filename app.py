@@ -1,18 +1,28 @@
-import io, re, csv, threading
+import io, re, csv, threading, os
 from typing import List, Tuple, Iterable, Dict
 
 import pdfplumber
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 import requests
 
-app = FastAPI(title="CNR PDF → CSV (Streaming, Locked)", version="1.6.0")
+app = FastAPI(title="CNR PDF → CSV (Streaming, Locked, Token)", version="1.7.0")
 
-# ---- Global lock: ensures only ONE parse/stream happens at a time ----
+# ====== Security & limits ======
+JOB_TOKEN = os.getenv("JOB_TOKEN", "")     # set in Render env; if blank, auth is disabled
+MAX_BYTES = int(os.getenv("MAX_BYTES", "2000000"))  # 2 MB default limit
+
+def require_token(headers) -> bool:
+    """Allow if JOB_TOKEN not set; otherwise require X-Job-Token header match."""
+    if not JOB_TOKEN:
+        return True
+    return headers.get("x-job-token") == JOB_TOKEN
+
+# ====== Global lock: exactly one parse at a time ======
 parse_lock = threading.Lock()
 
-# ---- Regex / constants ----
+# ====== Regex / constants ======
 DRIVER_HDR_RE = re.compile(r"(Delivered|Collected)\s+By:\s*(.+?)\s*\((\d+)\)", re.I)
 LOCATION_RE   = re.compile(r"Location:\s*(.+)", re.I)
 DATE_RE       = re.compile(r"\d{2}/\d{2}/\d{4}")
@@ -28,7 +38,7 @@ FINAL_COLUMNS = [
     "Collection Postcode","Location","Driver Name","Driver ID"
 ]
 
-# ---- helpers ----
+# ====== helpers ======
 def clean_ws(s: str) -> str:
     return re.sub(r"\s+"," ",str(s)).strip() if s is not None else ""
 
@@ -79,7 +89,7 @@ def page_context(page) -> Tuple[str,str,str]:
     if m: name, did = clean_ws(m.group(2)), clean_ws(m.group(3))
     return sec, name, did
 
-# ---- core parser → yields dict rows ----
+# ====== core parser → yields dict rows ======
 def iter_parsed_rows(pdf_bytes: bytes) -> Iterable[Dict[str,str]]:
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         location = extract_location_from_first_page(pdf)
@@ -195,10 +205,9 @@ def iter_parsed_rows(pdf_bytes: bytes) -> Iterable[Dict[str,str]]:
         for sr in pending_stop_rows:
             yield sr
 
-# ---- CSV streaming with the GLOBAL LOCK held the whole time ----
+# ====== CSV streaming (lock held the entire run) ======
 def stream_csv(pdf_bytes: bytes, filename="cleaned.csv") -> StreamingResponse:
     def gen():
-        # Acquire the lock for the entire parse+stream, ensuring strict one-at-a-time processing
         with parse_lock:
             buf = io.StringIO()
             w = csv.DictWriter(buf, fieldnames=FINAL_COLUMNS, extrasaction="ignore")
@@ -211,7 +220,7 @@ def stream_csv(pdf_bytes: bytes, filename="cleaned.csv") -> StreamingResponse:
     return StreamingResponse(gen(), media_type="text/csv",
                              headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
-# ---- API ----
+# ====== API ======
 class UrlIn(BaseModel):
     file_url: str
 
@@ -224,19 +233,31 @@ def healthz():
     return {"status":"healthy"}
 
 @app.post("/process/url")
-def process_url(body: UrlIn):
+def process_url(body: UrlIn, request: Request):
+    # Auth
+    if not require_token(request.headers):
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    # Download (check size via headers first)
     try:
-        # Download outside the lock so we don't block while fetching
-        r = requests.get(body.file_url, timeout=60)
-        r.raise_for_status()
-        return stream_csv(r.content, "cleaned.csv")
+        with requests.get(body.file_url, stream=True, timeout=60) as r:
+            r.raise_for_status()
+            cl = r.headers.get("content-length")
+            if cl and int(cl) > MAX_BYTES:
+                return JSONResponse(status_code=413, content={"error": "file too large"})
+            pdf_bytes = r.content  # safe: your files are ~60–180 KB
+        return stream_csv(pdf_bytes, "cleaned.csv")
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
 
 @app.post("/process/file")
-async def process_file(file: UploadFile = File(...)):
+async def process_file(file: UploadFile = File(...), request: Request = None):
+    # Auth
+    if request and not require_token(request.headers):
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
     try:
         pdf_bytes = await file.read()
+        if len(pdf_bytes) > MAX_BYTES:
+            return JSONResponse(status_code=413, content={"error": "file too large"})
         name = (file.filename or "cleaned").replace(".pdf","") + ".csv"
         return stream_csv(pdf_bytes, name)
     except Exception as e:
